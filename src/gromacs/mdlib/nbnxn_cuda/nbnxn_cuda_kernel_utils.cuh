@@ -1,7 +1,7 @@
 /*
  * This file is part of the GROMACS molecular simulation package.
  *
- * Copyright (c) 2012,2013,2014,  by the GROMACS development team, led by
+ * Copyright (c) 2012,2013,2014,2016, by the GROMACS development team, led by
  * Mark Abraham, David van der Spoel, Berk Hess, and Erik Lindahl,
  * and including many others, as listed in the AUTHORS file in the
  * top-level source directory and at http://www.gromacs.org.
@@ -90,6 +90,21 @@ extern texture<float, 1, cudaReadModeElementType> nbfp_comb_texref;
 /*! Texture reference for Ewald coulomb force table; bound to cu_nbparam_t.coulomb_tab */
 extern texture<float, 1, cudaReadModeElementType> coulomb_tab_texref;
 #endif /* GMX_CUDA_NB_SINGLE_COMPILATION_UNIT */
+
+/*! Convert LJ sigma,epsilon parameters to C6,C12. */
+static __forceinline__ __device__
+void convert_sigma_epsilon_to_c6_c12(const float  sigma,
+                                     const float  epsilon,
+                                     float       *c6,
+                                     float       *c12)
+{
+    float sigma2, sigma6;
+
+    sigma2 = sigma * sigma;
+    sigma6 = sigma2 *sigma2 * sigma2;
+    *c6    = epsilon * sigma6;
+    *c12   = *c6 * sigma6;
+}
 
 /*! Apply force switch,  force + energy version. */
 static __forceinline__ __device__
@@ -579,7 +594,7 @@ void reduce_force_i_warp_shfl(float3 fin, float3 *fout,
     /* Threads 0,1,2 and 4,5,6 increment x,y,z for their warp */
     if ((tidxj & 3) < 3)
     {
-        atomicAdd(&fout[aidx].x + (tidxj & ~4), fin.x);
+        atomicAdd(&fout[aidx].x + (tidxj & 3), fin.x);
 
         if (bCalcFshift)
         {

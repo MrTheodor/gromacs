@@ -257,6 +257,10 @@ Performance and Run Control
         used in initializing domain decomposition communicators. Rank reordering
         is default, but can be switched off with this environment variable.
 
+``GMX_NO_LJ_COMB_RULE``
+        force the use of LJ paremeter lookup instead of using combination rules
+        in the non-bonded kernels.
+
 ``GMX_NO_CUDA_STREAMSYNC``
         the opposite of ``GMX_CUDA_STREAMSYNC``. Disables the use of the
         standard cudaStreamSynchronize-based GPU waiting to improve performance when using CUDA driver API
@@ -411,6 +415,14 @@ compilation of OpenCL kernels, but they are also used in device selection.
         exists only for debugging purposes. Do not expect |Gromacs| to
         function properly with this option on, it is solely for the
         simplicity of stepping in a kernel and see what is happening.
+
+``GMX_OCL_DISABLE_I_PREFETCH``
+        Disables i-atom data (type or LJ parameter) prefetch allowig
+        testing.
+
+``GMX_OCL_ENABLE_I_PREFETCH``
+        Enables i-atom data (type or LJ parameter) prefetch allowig
+        testing on platforms where this behavior is not default.
 
 ``GMX_OCL_NB_ANA_EWALD``
         Forces the use of analytical Ewald kernels. Equivalent of

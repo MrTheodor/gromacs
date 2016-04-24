@@ -65,6 +65,7 @@
 #include "gromacs/gmxlib/md_logging.h"
 #include "gromacs/gmxlib/network.h"
 #include "gromacs/gpu_utils/gpu_utils.h"
+#include "gromacs/hardware/cpuinfo.h"
 #include "gromacs/hardware/detecthardware.h"
 #include "gromacs/listed-forces/disre.h"
 #include "gromacs/listed-forces/orires.h"
@@ -94,6 +95,8 @@
 #include "gromacs/mdtypes/md_enums.h"
 #include "gromacs/mdtypes/state.h"
 #include "gromacs/pbcutil/pbc.h"
+#include "gromacs/pulling/pull.h"
+#include "gromacs/pulling/pull_rotation.h"
 #include "gromacs/timing/wallcycle.h"
 #include "gromacs/topology/mtop_util.h"
 #include "gromacs/trajectory/trajectoryframe.h"
@@ -314,6 +317,11 @@ const int           nstlist_try[] = { 20, 25, 40 };
 static const float  nbnxn_cpu_listfac_ok    = 1.05;
 //! Too high performance ratio beween force calc and neighbor searching
 static const float  nbnxn_cpu_listfac_max   = 1.09;
+/* CPU: pair-search is about a factor 2-3 slower than the non-bonded kernel */
+//! Max OK performance ratio beween force calc and neighbor searching
+static const float  nbnxn_knl_listfac_ok    = 1.22;
+//! Too high performance ratio beween force calc and neighbor searching
+static const float  nbnxn_knl_listfac_max   = 1.3;
 /* GPU: pair-search is a factor 1.5-3 slower than the non-bonded kernel */
 //! Max OK performance ratio beween force calc and neighbor searching
 static const float  nbnxn_gpu_listfac_ok    = 1.20;
@@ -324,7 +332,7 @@ static const float  nbnxn_gpu_listfac_max   = 1.30;
 static void increase_nstlist(FILE *fp, t_commrec *cr,
                              t_inputrec *ir, int nstlist_cmdline,
                              const gmx_mtop_t *mtop, matrix box,
-                             gmx_bool bGPU)
+                             gmx_bool bGPU, const gmx::CpuInfo &cpuinfo)
 {
     float                  listfac_ok, listfac_max;
     int                    nstlist_orig, nstlist_prev;
@@ -404,6 +412,11 @@ static void increase_nstlist(FILE *fp, t_commrec *cr,
     {
         listfac_ok  = nbnxn_gpu_listfac_ok;
         listfac_max = nbnxn_gpu_listfac_max;
+    }
+    else if (cpuinfo.feature(gmx::CpuInfo::Feature::X86_Avx512ER))
+    {
+        listfac_ok  = nbnxn_knl_listfac_ok;
+        listfac_max = nbnxn_knl_listfac_max;
     }
     else
     {
@@ -534,7 +547,8 @@ static void prepare_verlet_scheme(FILE                           *fplog,
                                   int                             nstlist_cmdline,
                                   const gmx_mtop_t               *mtop,
                                   matrix                          box,
-                                  gmx_bool                        bUseGPU)
+                                  gmx_bool                        bUseGPU,
+                                  const gmx::CpuInfo             &cpuinfo)
 {
     /* For NVE simulations, we will retain the initial list buffer */
     if (EI_DYNAMICS(ir->eI) &&
@@ -574,7 +588,7 @@ static void prepare_verlet_scheme(FILE                           *fplog,
     if (EI_DYNAMICS(ir->eI))
     {
         /* Set or try nstlist values */
-        increase_nstlist(fplog, cr, ir, nstlist_cmdline, mtop, box, bUseGPU);
+        increase_nstlist(fplog, cr, ir, nstlist_cmdline, mtop, box, bUseGPU, cpuinfo);
     }
 }
 
@@ -761,7 +775,7 @@ int mdrunner(gmx_hw_opt_t *hw_opt,
 
             prepare_verlet_scheme(fplog, cr,
                                   inputrec, nstlist_cmdline, mtop, state->box,
-                                  bUseGPU);
+                                  bUseGPU, *hwinfo->cpuInfo);
         }
         else
         {
@@ -1265,6 +1279,22 @@ int mdrunner(gmx_hw_opt_t *hw_opt,
         /* Assumes uniform use of the number of OpenMP threads */
         walltime_accounting = walltime_accounting_init(gmx_omp_nthreads_get(emntDefault));
 
+        if (inputrec->bPull)
+        {
+            /* Initialize pull code */
+            inputrec->pull_work =
+                init_pull(fplog, inputrec->pull, inputrec, nfile, fnm,
+                          mtop, cr, oenv, inputrec->fepvals->init_lambda,
+                          EI_DYNAMICS(inputrec->eI) && MASTER(cr), Flags);
+        }
+
+        if (inputrec->bRot)
+        {
+            /* Initialize enforced rotation code */
+            init_rot(fplog, inputrec, nfile, fnm, cr, state->x, state->box, mtop, oenv,
+                     bVerbose, Flags);
+        }
+
         constr = init_constraints(fplog, mtop, inputrec, ed, state, cr);
 
         if (DOMAINDECOMP(cr))
@@ -1290,6 +1320,17 @@ int mdrunner(gmx_hw_opt_t *hw_opt,
                                      imdport,
                                      Flags,
                                      walltime_accounting);
+
+        if (inputrec->bRot)
+        {
+            finish_rot(inputrec->rot);
+        }
+
+        if (inputrec->bPull)
+        {
+            finish_pull(inputrec->pull_work);
+        }
+
     }
     else
     {

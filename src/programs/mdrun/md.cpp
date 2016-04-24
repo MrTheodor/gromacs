@@ -56,6 +56,7 @@
 #include "gromacs/gmxlib/md_logging.h"
 #include "gromacs/gmxlib/network.h"
 #include "gromacs/gmxlib/nrnb.h"
+#include "gromacs/gpu_utils/gpu_utils.h"
 #include "gromacs/imd/imd.h"
 #include "gromacs/listed-forces/manage-threading.h"
 #include "gromacs/math/functions.h"
@@ -99,7 +100,6 @@
 #include "gromacs/pbcutil/mshift.h"
 #include "gromacs/pbcutil/pbc.h"
 #include "gromacs/pulling/pull.h"
-#include "gromacs/pulling/pull_rotation.h"
 #include "gromacs/swap/swapcoords.h"
 #include "gromacs/timing/wallcycle.h"
 #include "gromacs/timing/walltime_accounting.h"
@@ -165,6 +165,7 @@ static void reset_all_counters(FILE *fplog, t_commrec *cr,
     if (use_GPU(nbv))
     {
         nbnxn_gpu_reset_timings(nbv);
+        resetGpuProfiler();
     }
 
     wallcycle_stop(wcycle, ewcRUN);
@@ -341,21 +342,7 @@ double gmx::do_md(FILE *fplog, t_commrec *cr, int nfile, const t_filenm fnm[],
         /* Note that membed cannot work in parallel because mtop is
          * changed here. Fix this if we ever want to make it run with
          * multiple ranks. */
-        membed = init_membed(fplog, nfile, fnm, top_global, ir, state, cr, &cpt_period);
-    }
-    if (ir->bPull)
-    {
-        /* Initialize pull code */
-        ir->pull_work = init_pull(fplog, ir->pull, ir, nfile, fnm,
-                                  top_global, cr, oenv, ir->fepvals->init_lambda,
-                                  EI_DYNAMICS(ir->eI) && MASTER(cr), Flags);
-    }
-
-    if (ir->bRot)
-    {
-        /* Initialize enforced rotation code */
-        init_rot(fplog, ir, nfile, fnm, cr, state_global->x, state_global->box, top_global, oenv,
-                 bVerbose, Flags);
+        membed = init_membed(fplog, nfile, fnm, top_global, ir, state_global, cr, &cpt_period);
     }
 
     if (ir->eSwapCoords != eswapNO)
@@ -1831,16 +1818,10 @@ double gmx::do_md(FILE *fplog, t_commrec *cr, int nfile, const t_filenm fnm[],
         print_replica_exchange_statistics(fplog, repl_ex);
     }
 
-    // TODO clean up swapcoords
-
-    if (ir->bRot)
+    // Clean up swapcoords
+    if (ir->eSwapCoords != eswapNO)
     {
-        finish_rot(ir->rot);
-    }
-
-    if (ir->bPull)
-    {
-        finish_pull(ir->pull_work);
+        finish_swapcoords(ir->swap);
     }
 
     if (membed != nullptr)
