@@ -575,6 +575,8 @@ detectLogicalProcessorCount()
         count = sysconf(_SC_NPROCESSORS_ONLN);
 #    elif defined(_SC_NPROC_ONLN)
         count = sysconf(_SC_NPROC_ONLN);
+#    else
+#       warning "No valid sysconf argument value found. Executables will not be able to determine the number of logical cores: mdrun will use 1 thread by default!"
 #    endif      // End of check for sysconf argument values
 
 #else
@@ -625,6 +627,24 @@ HardwareTopology HardwareTopology::detect()
 HardwareTopology::HardwareTopology()
     : supportLevel_(SupportLevel::None)
 {
+}
+
+int HardwareTopology::numberOfCores() const
+{
+    if (supportLevel() >= SupportLevel::Basic)
+    {
+        // We assume all sockets have the same number of cores as socket 0.
+        // Since topology information is present, we can assume there is at least one socket.
+        return machine().sockets.size() * machine().sockets[0].cores.size();
+    }
+    else if (supportLevel() >= SupportLevel::LogicalProcessorCount)
+    {
+        return machine().logicalProcessorCount;
+    }
+    else
+    {
+        return 0;
+    }
 }
 
 } // namespace gmx

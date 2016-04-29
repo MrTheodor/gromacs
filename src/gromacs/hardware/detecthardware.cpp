@@ -92,13 +92,10 @@ static const bool bGPUBinary = GMX_GPU != GMX_GPU_NONE;
 static const bool gpuSharingSupport[] = { false, true, true };
 static const bool bGpuSharingSupported = gpuSharingSupport[GMX_GPU];
 
-/* CUDA supports everything. Our current OpenCL implementation seems
- * to handle concurrency correctly with thread-MPI. The AMD OpenCL
- * runtime does not seem to support creating a context from more than
- * one real MPI rank on the same node (it segfaults when you try).
+/* Both CUDA and OpenCL (on the tested/supported platforms) supports everything.
  */
 static const bool multiGpuSupport[] = {
-    false, true, GMX_THREAD_MPI
+    false, true, true
 };
 static const bool bMultiGpuPerNodeSupported = multiGpuSupport[GMX_GPU];
 
@@ -607,51 +604,17 @@ static int gmx_count_gpu_dev_unique(const gmx_gpu_info_t *gpu_info,
     return uniq_count;
 }
 
-static int get_ncores(const gmx::HardwareTopology &hwTop)
-{
-    if (hwTop.supportLevel() >= gmx::HardwareTopology::SupportLevel::None)
-    {
-        return hwTop.machine().logicalProcessorCount;
-    }
-    else
-    {
-        return 0;
-    }
-}
-
-/* Return the number of hardware threads supported by the current CPU.
- * We assume that this is equal with the number of "processors"
- * reported to be online by the OS at the time of the call. The
- * definition of "processor" is according to an old POSIX standard.
- *
- * On e.g. Arm, the Linux kernel can use advanced power saving features where
+/* On e.g. Arm, the Linux kernel can use advanced power saving features where
  * processors are brought online/offline dynamically. This will cause
  * _SC_NPROCESSORS_ONLN to report 1 at the beginning of the run. For this
- * reason we now first try to use the number of configured processors, but
- * also warn if they mismatch.
- *
- * Note that the number of hardware threads is generally greater than
- * the number of cores (e.g. x86 hyper-threading, Power). Managing the
- * mapping of software threads to hardware threads is managed
- * elsewhere.
+ * reason we now warn if this mismatches with the detected core count.
  */
-static int get_nthreads_hw_avail(FILE gmx_unused *fplog, const t_commrec gmx_unused *cr)
+static void check_nthreads_hw_avail(const t_commrec gmx_unused *cr,
+                                    FILE gmx_unused *fplog, int nthreads)
 {
-    int ret = 0;
-
-#if ((defined(WIN32) || defined( _WIN32 ) || defined(WIN64) || defined( _WIN64 )) && !(defined (__CYGWIN__) || defined (__CYGWIN32__)))
-    /* Windows */
-    SYSTEM_INFO sysinfo;
-    GetSystemInfo( &sysinfo );
-    ret = sysinfo.dwNumberOfProcessors;
-#elif defined HAVE_SYSCONF
-    /* We are probably on Unix.
-     * Now check if we have the argument to use before executing the call
-     */
-#if defined(_SC_NPROCESSORS_CONF)
-    ret = sysconf(_SC_NPROCESSORS_CONF);
-#    if defined(_SC_NPROCESSORS_ONLN)
-    if (ret != sysconf(_SC_NPROCESSORS_ONLN))
+// Now check if we have the argument to use before executing the call
+#if defined(HAVE_SYSCONF) && defined(_SC_NPROCESSORS_ONLN)
+    if (nthreads != sysconf(_SC_NPROCESSORS_ONLN))
     {
         md_print_warn(cr, fplog,
                       "%d CPUs configured, but only %d of them are online.\n"
@@ -659,40 +622,24 @@ static int get_nthreads_hw_avail(FILE gmx_unused *fplog, const t_commrec gmx_unu
                       "off to save power, and will turn them back on later when the load increases.\n"
                       "However, this will likely mean GROMACS cannot pin threads to those cores. You\n"
                       "will likely see much better performance by forcing all cores to be online, and\n"
-                      "making sure they run at their full clock frequency.", ret, sysconf(_SC_NPROCESSORS_ONLN));
+                      "making sure they run at their full clock frequency.", nthreads, sysconf(_SC_NPROCESSORS_ONLN));
     }
-#    endif
-#elif defined(_SC_NPROC_CONF)
-    ret = sysconf(_SC_NPROC_CONF);
-#elif defined(_SC_NPROCESSORS_ONLN)
-    ret = sysconf(_SC_NPROCESSORS_ONLN);
-#elif defined(_SC_NPROC_ONLN)
-    ret = sysconf(_SC_NPROC_ONLN);
-#else
-#    warning "No valid sysconf argument value found. Executables will not be able to determine the number of logical cores: mdrun will use 1 thread by default!"
-#endif /* End of check for sysconf argument values */
-
-#else
-    /* Neither windows nor Unix. No fscking idea how many hardware threads we have! */
-    ret = -1;
 #endif
 
     if (debug)
     {
-        fprintf(debug, "Detected %d hardware threads to use.\n", ret);
+        fprintf(debug, "Detected %d hardware threads to use.\n", nthreads);
     }
 
 #if GMX_OPENMP
-    if (ret != gmx_omp_get_num_procs())
+    if (nthreads != gmx_omp_get_num_procs())
     {
         md_print_warn(cr, fplog,
                       "Number of logical cores detected (%d) does not match the number reported by OpenMP (%d).\n"
                       "Consider setting the launch configuration manually!",
-                      ret, gmx_omp_get_num_procs());
+                      nthreads, gmx_omp_get_num_procs());
     }
 #endif
-
-    return ret;
 }
 
 static void gmx_detect_gpus(FILE *fplog, const t_commrec *cr)
@@ -707,6 +654,10 @@ static void gmx_detect_gpus(FILE *fplog, const t_commrec *cr)
      * can not simultaneously access the same GPU(s). Therefore we run
      * the detection only on one MPI rank per node and broadcast the info.
      * Note that with thread-MPI only a single thread runs this code.
+     *
+     * NOTE: We can't broadcast gpu_info with OpenCL as the device and platform
+     * ID stored in the structure are unique for each rank (even if a device
+     * is shared by multiple ranks).
      *
      * TODO: We should also do CPU hardware detection only once on each
      * physical node and broadcast it, instead of do it on every MPI rank.
@@ -726,7 +677,11 @@ static void gmx_detect_gpus(FILE *fplog, const t_commrec *cr)
     rank_local = 0;
 #endif
 
-    if (rank_local == 0)
+    /*  With CUDA detect only on one rank per host, with OpenCL need do
+     *  the detection on all PP ranks */
+    bool isOpenclPpRank = ((GMX_GPU == GMX_GPU_OPENCL) && (cr->duty & DUTY_PP));
+
+    if (rank_local == 0 || isOpenclPpRank)
     {
         char detection_error[STRLEN] = "", sbuf[STRLEN];
 
@@ -748,24 +703,27 @@ static void gmx_detect_gpus(FILE *fplog, const t_commrec *cr)
     }
 
 #if GMX_LIB_MPI
-    /* Broadcast the GPU info to the other ranks within this node */
-    MPI_Bcast(&hwinfo_g->gpu_info.n_dev, 1, MPI_INT, 0, physicalnode_comm);
-
-    if (hwinfo_g->gpu_info.n_dev > 0)
+    if (!isOpenclPpRank)
     {
-        int dev_size;
+        /* Broadcast the GPU info to the other ranks within this node */
+        MPI_Bcast(&hwinfo_g->gpu_info.n_dev, 1, MPI_INT, 0, physicalnode_comm);
 
-        dev_size = hwinfo_g->gpu_info.n_dev*sizeof_gpu_dev_info();
-
-        if (rank_local > 0)
+        if (hwinfo_g->gpu_info.n_dev > 0)
         {
-            hwinfo_g->gpu_info.gpu_dev =
-                (struct gmx_device_info_t *)malloc(dev_size);
+            int dev_size;
+
+            dev_size = hwinfo_g->gpu_info.n_dev*sizeof_gpu_dev_info();
+
+            if (rank_local > 0)
+            {
+                hwinfo_g->gpu_info.gpu_dev =
+                    (struct gmx_device_info_t *)malloc(dev_size);
+            }
+            MPI_Bcast(hwinfo_g->gpu_info.gpu_dev, dev_size, MPI_BYTE,
+                      0, physicalnode_comm);
+            MPI_Bcast(&hwinfo_g->gpu_info.n_dev_compatible, 1, MPI_INT,
+                      0, physicalnode_comm);
         }
-        MPI_Bcast(hwinfo_g->gpu_info.gpu_dev, dev_size, MPI_BYTE,
-                  0, physicalnode_comm);
-        MPI_Bcast(&hwinfo_g->gpu_info.n_dev_compatible, 1, MPI_INT,
-                  0, physicalnode_comm);
     }
 
     MPI_Comm_free(&physicalnode_comm);
@@ -774,16 +732,16 @@ static void gmx_detect_gpus(FILE *fplog, const t_commrec *cr)
 
 static void gmx_collect_hardware_mpi(const gmx::CpuInfo &cpuInfo)
 {
+    const int ncore = hwinfo_g->hardwareTopology->numberOfCores();
 #if GMX_LIB_MPI
-    int  rank_id;
-    int  nrank, rank, ncore, nhwthread, ngpu, i;
-    int  gpu_hash;
-    int *buf, *all;
+    int       rank_id;
+    int       nrank, rank, nhwthread, ngpu, i;
+    int       gpu_hash;
+    int      *buf, *all;
 
     rank_id   = gmx_physicalnode_id_hash();
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &nrank);
-    ncore     = hwinfo_g->ncore;
     nhwthread = hwinfo_g->nthreads_hw_avail;
     ngpu      = hwinfo_g->gpu_info.n_dev_compatible;
     /* Create a unique hash of the GPU type(s) in this node */
@@ -888,9 +846,9 @@ static void gmx_collect_hardware_mpi(const gmx::CpuInfo &cpuInfo)
     /* All ranks use the same pointer, protect it with a mutex */
     tMPI_Thread_mutex_lock(&hw_info_lock);
     hwinfo_g->nphysicalnode       = 1;
-    hwinfo_g->ncore_tot           = hwinfo_g->ncore;
-    hwinfo_g->ncore_min           = hwinfo_g->ncore;
-    hwinfo_g->ncore_max           = hwinfo_g->ncore;
+    hwinfo_g->ncore_tot           = ncore;
+    hwinfo_g->ncore_min           = ncore;
+    hwinfo_g->ncore_max           = ncore;
     hwinfo_g->nhwthread_tot       = hwinfo_g->nthreads_hw_avail;
     hwinfo_g->nhwthread_min       = hwinfo_g->nthreads_hw_avail;
     hwinfo_g->nhwthread_max       = hwinfo_g->nthreads_hw_avail;
@@ -924,11 +882,9 @@ gmx_hw_info_t *gmx_detect_hardware(FILE *fplog, const t_commrec *cr,
         hwinfo_g->cpuInfo             = new gmx::CpuInfo(gmx::CpuInfo::detect());
         hwinfo_g->hardwareTopology    = new gmx::HardwareTopology(gmx::HardwareTopology::detect());
 
-        /* get the number of cores, will be 0 when not detected */
-        hwinfo_g->ncore             = get_ncores(*hwinfo_g->hardwareTopology);
-
-        /* detect number of hardware threads */
-        hwinfo_g->nthreads_hw_avail = get_nthreads_hw_avail(fplog, cr);
+        // TODO: Get rid of this altogether.
+        hwinfo_g->nthreads_hw_avail = hwinfo_g->hardwareTopology->machine().logicalProcessorCount;
+        check_nthreads_hw_avail(cr, fplog, hwinfo_g->nthreads_hw_avail);
 
         /* detect GPUs */
         hwinfo_g->gpu_info.n_dev            = 0;
