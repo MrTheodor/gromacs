@@ -313,6 +313,7 @@ void registerLegacyModules(gmx::CommandLineModuleManager *manager)
                    "Calculate the minimum distance between two groups");
     registerModule(manager, &gmx_msd, "msd",
                    "Calculates mean square displacements");
+    registerModule(manager, &gmx_displ, "displ", "Calculates mean displacements");
     registerModule(manager, &gmx_nmeig, "nmeig",
                    "Diagonalize the Hessian for normal mode analysis");
     registerModule(manager, &gmx_nmens, "nmens",

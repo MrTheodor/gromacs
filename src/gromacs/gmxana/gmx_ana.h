@@ -138,6 +138,9 @@ int
 gmx_msd(int argc, char *argv[]);
 
 int
+gmx_displ(int argc, char *argv[]);
+
+int
 gmx_nmeig(int argc, char *argv[]);
 
 int
